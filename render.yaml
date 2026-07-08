@@ -1,7 +1,6 @@
 services:
   - type: web
-    name: gmaps-shared-list-scraper
+    name: gmap-shared-list-scraper
     env: docker
-    plan: starter
-    autoDeploy: true
+    plan: free
     healthCheckPath: /health

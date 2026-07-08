@@ -1,82 +1,91 @@
-# Google Maps Shared List Scraper — Phone/App Integrated
+# Google Maps Shared List Scraper - ParseForge-like replica
 
-This is the self-hosted backend for your Sapporo iPhone HTML app.
+This is a self-hosted FastAPI + Playwright backend for importing public Google Maps shared lists into the Sapporo itinerary app.
 
-It exposes two identical endpoints:
+It is more ParseForge-like than the previous version because it does **three** extraction passes:
 
-- `POST /api/import-google-list` ← use this in your app
-- `POST /scrape-google-list` ← direct test endpoint
+1. Resolves `maps.app.goo.gl/...` short links in Chromium.
+2. Parses visible Google Maps list rows after repeated lazy-load scrolling.
+3. Parses hidden Google Maps page/network payloads for place URLs, feature IDs, CIDs, and coordinates.
 
-The response matches what your app expects:
+It returns the app-compatible shape:
 
 ```json
 {
   "ok": true,
-  "listName": "My Saved Places",
-  "sourceUrl": "https://maps.app.goo.gl/...",
+  "listName": "...",
   "count": 43,
   "places": [
     {
-      "name": "Place name",
-      "googleMapsUrl": "https://www.google.com/maps/place/...",
-      "latitude": 43.0,
-      "longitude": 141.0
+      "name": "...",
+      "googleMapsUrl": "...",
+      "lat": 43.06,
+      "lng": 141.35,
+      "address": "...",
+      "category": "restaurant"
     }
-  ],
-  "warnings": []
+  ]
 }
 ```
 
-## Phone setup
+## Deploy update on Render
 
-You cannot run Playwright/Chromium directly inside the iPhone HTML app. Deploy this folder as a backend, then paste the backend URL into the app gear/settings field.
+Upload/replace these files at the **root** of your GitHub scraper repository:
 
-Recommended endpoint to paste into the app:
+- `main.py`
+- `requirements.txt`
+- `Dockerfile`
+- `render.yaml`
+- `README.md`
+
+Then Render should auto-deploy. If not, open Render and use:
+
+**Manual Deploy → Deploy latest commit**
+
+After deploy, test:
 
 ```txt
-https://YOUR-RENDER-APP.onrender.com/api/import-google-list
+https://gmap-shared-list-scraper.onrender.com/health
 ```
 
-## Deploy on Render from your phone
+It should return:
 
-1. Download and unzip this package in the iPhone Files app.
-2. Open GitHub in Safari/Chrome, create a new repo, then upload these files to the repo root:
-   - `main.py`
-   - `requirements.txt`
-   - `Dockerfile`
-   - `render.yaml`
-3. Open Render, create a new Web Service from that GitHub repo.
-4. Use Docker environment.
-5. Health check path: `/health`.
-6. Deploy.
-7. Copy your Render URL and append `/api/import-google-list`.
-8. In the app: Google saved lists → tap ⚙️ → paste the endpoint → paste Google Maps shared list link → Import list.
-
-## Local setup, optional
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```json
+{"ok":true,"status":"ok","version":"2.0.0"}
 ```
 
-## Test
+## App endpoint
 
-```bash
-curl -X POST https://YOUR-RENDER-APP.onrender.com/api/import-google-list \
-  -H "Content-Type: application/json" \
-  -d '{
-    "listUrl":"https://maps.app.goo.gl/YOUR_LIST",
-    "maxPlacesPerList":500,
-    "scrapeDetails":false,
-    "headless":true
-  }'
+Your app can continue using:
+
+```txt
+https://gmap-shared-list-scraper.onrender.com/api/import-google-list
 ```
 
-## Notes
+No app change is required if your v55/v56 app already points to that URL.
 
-- `scrapeDetails` defaults to `false` for faster phone/app importing.
-- Set `scrapeDetails:true` only if you need address/rating/phone/website.
-- This is best-effort because Google Maps markup changes and may block automated browsers.
+## Manual test in browser
+
+Use a GET test URL like this:
+
+```txt
+https://gmap-shared-list-scraper.onrender.com/api/import-google-list?url=PASTE_ENCODED_GOOGLE_MAPS_LIST_URL&debug=true
+```
+
+Or use the `/docs` page:
+
+```txt
+https://gmap-shared-list-scraper.onrender.com/docs
+```
+
+## Optional proxy
+
+Google sometimes blocks Render's free datacenter IPs. If the endpoint returns 0 places or only a consent/CAPTCHA page, add a proxy in Render environment variables:
+
+```txt
+PROXY_SERVER=http://host:port
+PROXY_USERNAME=optional_username
+PROXY_PASSWORD=optional_password
+```
+
+Without a reliable proxy, no self-hosted Google Maps scraper can fully match paid Apify/ParseForge reliability.
