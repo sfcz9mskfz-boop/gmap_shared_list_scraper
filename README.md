@@ -1,91 +1,79 @@
-# Google Maps Shared List Scraper - ParseForge-like replica
+# Google Maps Shared List Scraper - Strict v3
 
-This is a self-hosted FastAPI + Playwright backend for importing public Google Maps shared lists into the Sapporo itinerary app.
+This version fixes the previous over-extraction issue by using the visible saved-list panel as the source of truth.
 
-It is more ParseForge-like than the previous version because it does **three** extraction passes:
+## What changed in v3
 
-1. Resolves `maps.app.goo.gl/...` short links in Chromium.
-2. Parses visible Google Maps list rows after repeated lazy-load scrolling.
-3. Parses hidden Google Maps page/network payloads for place URLs, feature IDs, CIDs, and coordinates.
+- Does **not** scan the entire Google Maps hidden payload by default.
+- Does **not** turn list metadata such as `Hokkaido Trip Taeun Kim` into a place.
+- Extracts only saved-list rows with real Google Maps place/cid/ftid links.
+- Reads list metadata separately: `listName`, `ownerName`, and visible count such as `43 places`.
+- If Google returns more unique place-like links than the visible saved-list count, v3 trims to the visible count to avoid nearby/search/recommendation spillover.
+- Adds `/debug`, a phone-friendly debug page showing accepted and rejected candidates.
 
-It returns the app-compatible shape:
+## Endpoints
+
+### App endpoint
+
+```txt
+POST /api/import-google-list
+```
+
+Body:
 
 ```json
 {
-  "ok": true,
-  "listName": "...",
-  "count": 43,
-  "places": [
-    {
-      "name": "...",
-      "googleMapsUrl": "...",
-      "lat": 43.06,
-      "lng": 141.35,
-      "address": "...",
-      "category": "restaurant"
-    }
-  ]
+  "listUrl": "https://maps.app.goo.gl/...",
+  "maxPlacesPerList": 500,
+  "scrapeDetails": false,
+  "strictListOnly": true
 }
 ```
 
-## Deploy update on Render
+### Debug page
 
-Upload/replace these files at the **root** of your GitHub scraper repository:
-
-- `main.py`
-- `requirements.txt`
-- `Dockerfile`
-- `render.yaml`
-- `README.md`
-
-Then Render should auto-deploy. If not, open Render and use:
-
-**Manual Deploy → Deploy latest commit**
-
-After deploy, test:
+Open this on your phone:
 
 ```txt
-https://gmap-shared-list-scraper.onrender.com/health
+https://YOUR-RENDER-SERVICE.onrender.com/debug
 ```
 
-It should return:
+Paste your Google Maps saved-list link and run. It will show:
+
+- saved list name
+- owner name
+- visible count
+- returned places
+- raw candidates
+- accepted places
+- rejected/ignored items with reasons
+
+### Health check
+
+```txt
+GET /health
+```
+
+Expected:
 
 ```json
-{"ok":true,"status":"ok","version":"2.0.0"}
+{"ok": true, "status": "ok", "version": "3.0.0-strict-list"}
 ```
 
-## App endpoint
+## Deploy on Render
 
-Your app can continue using:
+Upload these files to the root of your GitHub repository:
 
 ```txt
-https://gmap-shared-list-scraper.onrender.com/api/import-google-list
+main.py
+requirements.txt
+Dockerfile
+render.yaml
+README.md
 ```
 
-No app change is required if your v55/v56 app already points to that URL.
-
-## Manual test in browser
-
-Use a GET test URL like this:
+Then in Render:
 
 ```txt
-https://gmap-shared-list-scraper.onrender.com/api/import-google-list?url=PASTE_ENCODED_GOOGLE_MAPS_LIST_URL&debug=true
+Manual Deploy -> Deploy latest commit
 ```
-
-Or use the `/docs` page:
-
-```txt
-https://gmap-shared-list-scraper.onrender.com/docs
-```
-
-## Optional proxy
-
-Google sometimes blocks Render's free datacenter IPs. If the endpoint returns 0 places or only a consent/CAPTCHA page, add a proxy in Render environment variables:
-
-```txt
-PROXY_SERVER=http://host:port
-PROXY_USERNAME=optional_username
-PROXY_PASSWORD=optional_password
-```
-
-Without a reliable proxy, no self-hosted Google Maps scraper can fully match paid Apify/ParseForge reliability.

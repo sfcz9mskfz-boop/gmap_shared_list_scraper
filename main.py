@@ -7,19 +7,22 @@ import os
 import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, HttpUrl
 from playwright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("gmaps-shared-list-parseforge-like")
+logger = logging.getLogger("gmaps-shared-list-strict")
+
+APP_VERSION = "3.0.0-strict-list"
 
 app = FastAPI(
-    title="Google Maps Shared List Scraper - ParseForge-like Replica",
-    version="2.0.0",
+    title="Google Maps Shared List Scraper - Strict Saved List Replica",
+    version=APP_VERSION,
 )
 
 app.add_middleware(
@@ -36,13 +39,16 @@ class ScrapeRequest(BaseModel):
     maxPlacesPerList: int = Field(default=500, ge=1, le=500)
     scrapeDetails: bool = False
     headless: bool = True
-    timeoutSeconds: int = Field(default=70, ge=20, le=180)
+    timeoutSeconds: int = Field(default=85, ge=20, le=220)
     debug: bool = False
+    strictListOnly: bool = True
 
 
 class ScrapeResponse(BaseModel):
     ok: bool
     listName: Optional[str]
+    ownerName: Optional[str] = None
+    expectedCount: Optional[int] = None
     sourceUrl: str
     resolvedUrl: Optional[str] = None
     count: int
@@ -59,20 +65,18 @@ JUNK_NAMES = {
     "directions", "save", "saved", "share", "nearby", "send to phone", "website", "call",
     "copy link", "route", "open", "close", "more", "menu", "reviews", "photos", "google maps",
     "maps", "back", "search", "start", "add", "edit", "remove", "visited", "want to go",
+    "view all", "done", "cancel", "learn more", "settings", "sort", "follow", "following",
 }
 
-PLACE_URL_RE = re.compile(
-    r"https?://(?:www\.)?google\.[a-z.]+/(?:maps|travel)/(?:place|search|dir|preview/place)[^\s\"'<>\\)\]}]+",
-    re.I,
-)
-REL_PLACE_URL_RE = re.compile(r"(?<![A-Za-z0-9])(/maps/place/[^\s\"'<>\\)\]}]+)", re.I)
-CID_URL_RE = re.compile(r"https?://(?:www\.)?google\.[a-z.]+/maps\?cid=\d+[^\s\"'<>\\)\]}]*", re.I)
-MAPS_APP_RE = re.compile(r"https?://maps\.app\.goo\.gl/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+", re.I)
+PLACE_URL_RE = re.compile(r"/maps/place/|[?&]cid=\d+|[?&]ftid=0x[0-9a-fA-F]+:0x[0-9a-fA-F]+", re.I)
 FEATURE_ID_RE = re.compile(r"0x[0-9a-fA-F]+:0x[0-9a-fA-F]+")
-CID_RE = re.compile(r"(?:cid=|!1s)(\d{6,}|0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)")
-COORD_PAIR_RE = re.compile(r"(-?\d{1,2}\.\d{4,}),\s*(-?\d{1,3}\.\d{4,})")
 DATA_COORD_RE = re.compile(r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)")
 AT_COORD_RE = re.compile(r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)")
+COORD_PAIR_RE = re.compile(r"(-?\d{1,2}\.\d{4,}),\s*(-?\d{1,3}\.\d{4,})")
+COUNT_PATTERNS = [
+    re.compile(r"(\d{1,4})\s*(?:places?|장소|곳|件)", re.I),
+    re.compile(r"(?:places?|장소|saved places?)\s*[:：]?\s*(\d{1,4})", re.I),
+]
 
 
 def clean_text(value: Optional[Any]) -> Optional[str]:
@@ -81,6 +85,7 @@ def clean_text(value: Optional[Any]) -> Optional[str]:
     text = str(value)
     text = html.unescape(text)
     text = text.replace("\u200e", "").replace("\u202a", "").replace("\ufeff", "")
+    text = text.replace("\xa0", " ")
     text = re.sub(r"\\u003[dD]", "=", text)
     text = re.sub(r"\\u0026", "&", text)
     text = text.replace(r"\/", "/")
@@ -88,25 +93,19 @@ def clean_text(value: Optional[Any]) -> Optional[str]:
     return text or None
 
 
-def decode_google_text(value: str) -> str:
-    if not value:
-        return ""
-    value = html.unescape(value)
-    value = value.replace(r"\/", "/")
-    value = re.sub(r"\\u003[dD]", "=", value)
-    value = re.sub(r"\\u0026", "&", value)
-    value = re.sub(r"\\u002[fF]", "/", value)
-    # Keep this conservative; full unicode_escape can corrupt non-English place names.
-    return value
+def norm_text(value: Optional[str]) -> str:
+    value = clean_text(value) or ""
+    return re.sub(r"[^\w가-힣ぁ-んァ-ン一-龯]+", "", value.lower())
 
 
 def normalize_google_url(url: str) -> str:
-    url = decode_google_text(url.strip())
+    url = html.unescape((url or "").strip()).replace(r"\/", "/")
     if url.startswith("/"):
         url = "https://www.google.com" + url
-    url = url.rstrip(".,;:!\")'}]")
+    url = re.sub(r"\\u003[dD]", "=", url)
+    url = re.sub(r"\\u0026", "&", url)
     url = url.replace("&amp;", "&")
-    return url
+    return url.rstrip(".,;:!\")'}]")
 
 
 def stable_id(text: str) -> str:
@@ -129,12 +128,15 @@ def extract_lat_lng_from_text(text: str) -> Tuple[Optional[float], Optional[floa
     return None, None
 
 
-def place_name_from_url(url: str) -> Optional[str]:
+def place_name_from_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
     try:
         parsed = urlparse(url)
         match = re.search(r"/maps/place/([^/@?]+)", parsed.path)
         if match:
-            name = clean_text(unquote(match.group(1)).replace("+", " "))
+            raw = unquote(match.group(1)).replace("+", " ")
+            name = clean_text(raw)
             if name and name.lower() not in JUNK_NAMES and not name.lower().startswith("data="):
                 return name
         qs = parse_qs(parsed.query)
@@ -152,16 +154,15 @@ def extract_ids(text: str) -> Dict[str, Optional[str]]:
     out: Dict[str, Optional[str]] = {"cid": None, "featureId": None, "placeId": None}
     if not text:
         return out
-    feature = FEATURE_ID_RE.search(text)
-    if feature:
-        out["featureId"] = feature.group(0)
     cid_match = re.search(r"[?&]cid=(\d+)", text)
     if cid_match:
         out["cid"] = cid_match.group(1)
     ftid_match = re.search(r"[?&]ftid=([^&]+)", text)
     if ftid_match:
         out["featureId"] = unquote(ftid_match.group(1))
-    # ChIJ-style Place IDs frequently appear in detail URLs / payloads.
+    feature = FEATURE_ID_RE.search(text)
+    if feature and not out["featureId"]:
+        out["featureId"] = feature.group(0)
     place_id = re.search(r"ChI[A-Za-z0-9_-]{10,}", text)
     if place_id:
         out["placeId"] = place_id.group(0)
@@ -172,74 +173,100 @@ def maybe_category_from_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
     t = text.lower()
-    if any(x in t for x in ("restaurant", "ramen", "sushi", "izakaya", "food", "bar & grill")):
+    if any(x in t for x in ("restaurant", "ramen", "sushi", "izakaya", "food", "bar & grill", "yakiniku", "curry")):
         return "restaurant"
-    if any(x in t for x in ("cafe", "coffee", "bakery", "dessert")):
+    if any(x in t for x in ("cafe", "coffee", "bakery", "dessert", "roastery", "tea")):
         return "cafe"
-    if any(x in t for x in ("hotel", "inn", "ryokan", "lodging", "hostel")):
+    if any(x in t for x in ("hotel", "inn", "ryokan", "lodging", "hostel", "resort")):
         return "hotel"
-    if any(x in t for x in ("station", "airport", "bus stop", "train")):
+    if any(x in t for x in ("station", "airport", "bus stop", "train", "terminal")):
         return "transport"
-    if any(x in t for x in ("shop", "store", "market", "mall", "shopping")):
+    if any(x in t for x in ("shop", "store", "market", "mall", "shopping", "department")):
         return "shopping"
-    if any(x in t for x in ("park", "museum", "temple", "shrine", "garden", "tourist", "observation", "canal")):
+    if any(x in t for x in ("park", "museum", "temple", "shrine", "garden", "tourist", "observation", "canal", "zoo")):
         return "sight"
     return None
 
 
-def make_place(
-    *,
-    name: Optional[str] = None,
-    url: Optional[str] = None,
-    lat: Optional[float] = None,
-    lng: Optional[float] = None,
-    address: Optional[str] = None,
-    category: Optional[str] = None,
-    source: str = "unknown",
-    raw: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    name = clean_text(name)
-    url = normalize_google_url(url) if url else None
-    raw = raw or url or name or ""
-    if lat is None or lng is None:
-        lat2, lng2 = extract_lat_lng_from_text(raw)
-        lat = lat if lat is not None else lat2
-        lng = lng if lng is not None else lng2
-    ids = extract_ids(raw + " " + (url or ""))
-    if not name and url:
-        name = place_name_from_url(url)
-    if not url:
-        if ids.get("cid"):
-            url = f"https://www.google.com/maps?cid={ids['cid']}"
-        elif ids.get("featureId"):
-            url = f"https://www.google.com/maps/search/?api=1&query={ids['featureId']}"
-        elif lat is not None and lng is not None:
-            url = f"https://www.google.com/maps/search/?api=1&query={lat:.7f},{lng:.7f}"
-        elif name:
-            url = f"https://www.google.com/maps/search/{unquote(name).replace(' ', '+')}"
-    if not name and lat is not None and lng is not None:
-        name = "지도 좌표 위치"
+def has_place_url(url: Optional[str]) -> bool:
+    return bool(url and PLACE_URL_RE.search(url))
+
+
+def reject_reason(candidate: Dict[str, Any], list_name: Optional[str], owner_name: Optional[str], strict: bool = True) -> Optional[str]:
+    name = clean_text(candidate.get("name") or candidate.get("title"))
+    url = candidate.get("googleMapsUrl") or candidate.get("url")
+    raw = " ".join(str(candidate.get(k) or "") for k in ("name", "title", "address", "googleMapsUrl", "url", "rawText"))
+    n_name = norm_text(name)
+    n_list = norm_text(list_name)
+    n_owner = norm_text(owner_name)
+
     if not name and not url:
-        return None
+        return "no name or url"
     if name and name.lower() in JUNK_NAMES:
-        return None
-    if name and len(name) > 180:
-        # Usually a whole card text blob; keep the first short line when possible.
-        short = re.split(r"(?:\\n| · |  )", name)[0].strip()
-        name = short[:180]
-    key_seed = ids.get("placeId") or ids.get("cid") or ids.get("featureId") or url or f"{name}|{lat}|{lng}"
-    return {
-        "id": stable_id(key_seed),
+        return "ui control, not a place"
+    if n_list and n_name == n_list:
+        return "saved-list title, not a place"
+    if n_owner and n_name == n_owner:
+        return "saved-list owner, not a place"
+    if n_list and n_owner and n_name in {n_list + n_owner, n_owner + n_list}:
+        return "combined saved-list title/owner, not a place"
+    if n_list and n_owner and n_list in n_name and n_owner in n_name:
+        return "saved-list metadata, not a place"
+    if strict and not has_place_url(url):
+        return "not a Google Maps place/cid/ftid URL"
+    if name and len(name) > 140:
+        return "name is too long; likely a text blob"
+    if name and re.search(r"^(https?://|www\.|maps\.app\.goo\.gl)", name, re.I):
+        return "url used as name"
+    if raw and re.search(r"Hokkaido Trip\s+Taeun Kim", raw, re.I) and not has_place_url(url):
+        return "known list metadata text"
+    return None
+
+
+def make_place_from_candidate(candidate: Dict[str, Any], list_name: Optional[str], owner_name: Optional[str], strict: bool = True) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    href = normalize_google_url(candidate.get("href") or candidate.get("url") or "") if (candidate.get("href") or candidate.get("url")) else None
+    aria = clean_text(candidate.get("aria"))
+    text = clean_text(candidate.get("text"))
+    raw_text = clean_text(candidate.get("rawText") or " ".join([href or "", aria or "", text or ""]))
+
+    url_name = place_name_from_url(href)
+    name = clean_text(candidate.get("name")) or url_name or aria
+    address = clean_text(candidate.get("address"))
+
+    if text:
+        lines = [clean_text(x) for x in re.split(r"[\n\r]+|\\n", text) if clean_text(x)]
+        if not name and lines:
+            name = lines[0]
+        if not address and len(lines) > 1:
+            address = next((x for x in lines[1:7] if not re.search(r"stars?|reviews?|minutes?|closed|open|saved|share|directions", x, re.I)), None)
+
+    if not name and href:
+        name = url_name
+    if name and len(name) > 140:
+        name = re.split(r"(?: · |  |\\n)", name)[0][:140]
+
+    lat, lng = extract_lat_lng_from_text(" ".join([href or "", raw_text or ""]))
+    ids = extract_ids(" ".join([href or "", raw_text or ""]))
+    if not href:
+        if ids.get("cid"):
+            href = f"https://www.google.com/maps?cid={ids['cid']}"
+        elif ids.get("featureId"):
+            href = f"https://www.google.com/maps/search/?api=1&query={quote_plus(ids['featureId'])}"
+        elif lat is not None and lng is not None and not strict:
+            href = f"https://www.google.com/maps/search/?api=1&query={lat:.7f},{lng:.7f}"
+
+    place = {
+        "id": stable_id(ids.get("placeId") or ids.get("cid") or ids.get("featureId") or href or f"{name}|{lat}|{lng}"),
         "placeId": ids.get("placeId"),
         "cid": ids.get("cid"),
         "featureId": ids.get("featureId"),
         "name": name,
         "title": name,
-        "address": clean_text(address),
-        "category": category or maybe_category_from_text(name or "") or maybe_category_from_text(address or ""),
-        "type": category or maybe_category_from_text(name or "") or maybe_category_from_text(address or ""),
-        "googleMapsUrl": url,
-        "url": url,
+        "address": address,
+        "category": maybe_category_from_text(name or "") or maybe_category_from_text(address or ""),
+        "type": maybe_category_from_text(name or "") or maybe_category_from_text(address or ""),
+        "googleMapsUrl": href,
+        "url": href,
         "latitude": lat,
         "longitude": lng,
         "lat": lat,
@@ -248,8 +275,15 @@ def make_place(
         "reviewCount": None,
         "phone": None,
         "website": None,
-        "source": source,
+        "source": candidate.get("source") or "strict_dom",
+        "listIndex": candidate.get("index"),
+        "scrapedOk": None,
+        "rawText": raw_text if candidate.get("debug") else None,
     }
+    reason = reject_reason(place, list_name, owner_name, strict=strict)
+    if reason:
+        return None, reason
+    return place, None
 
 
 def merge_place(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
@@ -258,10 +292,6 @@ def merge_place(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str,
             continue
         if existing.get(key) in (None, "", [], {}):
             existing[key] = value
-    # Prefer human-readable names over coordinate placeholders.
-    if existing.get("name") == "지도 좌표 위치" and incoming.get("name") and incoming.get("name") != "지도 좌표 위치":
-        existing["name"] = incoming["name"]
-        existing["title"] = incoming["name"]
     return existing
 
 
@@ -289,59 +319,7 @@ def dedupe_places(places: Iterable[Dict[str, Any]], max_places: int) -> List[Dic
         else:
             seen[key] = place
             ordered.append(key)
-        if len(ordered) >= max_places:
-            break
     return [seen[k] for k in ordered[:max_places]]
-
-
-def extract_places_from_text_blob(text: str, source: str) -> List[Dict[str, Any]]:
-    text = decode_google_text(text or "")
-    if not text:
-        return []
-    candidates: List[Dict[str, Any]] = []
-
-    for regex in (PLACE_URL_RE, REL_PLACE_URL_RE, CID_URL_RE):
-        for m in regex.finditer(text):
-            url = normalize_google_url(m.group(0))
-            candidates.append(make_place(url=url, raw=url, source=source))
-
-    # Feature IDs often appear in list payload even when URLs are not visible.
-    # Create searchable Google Maps URLs from them; detail enrichment can later fill names.
-    for m in FEATURE_ID_RE.finditer(text):
-        window = text[max(0, m.start() - 500): min(len(text), m.end() + 500)]
-        lat, lng = extract_lat_lng_from_text(window)
-        name = best_string_near_feature(window)
-        candidates.append(make_place(name=name, url=None, lat=lat, lng=lng, raw=m.group(0) + " " + window, source=source))
-
-    return [p for p in candidates if p]
-
-
-def best_string_near_feature(window: str) -> Optional[str]:
-    # Pull plausible human labels from JSON/stringified payload windows.
-    strings = re.findall(r'"([^"\\]{2,120})"', window)
-    cleaned: List[str] = []
-    for s in strings:
-        s = clean_text(s)
-        if not s:
-            continue
-        low = s.lower()
-        if low in JUNK_NAMES:
-            continue
-        if low.startswith(("http", "0x", "//", "/maps", "data=", "!")):
-            continue
-        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", s):
-            continue
-        if len(s) < 2 or len(s) > 80:
-            continue
-        # Avoid internal RPC / class / CSS strings.
-        if re.search(r"[{}<>]|\\u|google|maps|schema|aria|function|var |null", s, re.I):
-            continue
-        cleaned.append(s)
-    if not cleaned:
-        return None
-    # Prefer strings with letters and spaces but no obvious address-only commas.
-    cleaned.sort(key=lambda x: (bool(re.search(r"[A-Za-z가-힣ぁ-んァ-ン一-龯]", x)), -abs(len(x) - 22)), reverse=True)
-    return cleaned[0]
 
 
 async def safe_text(locator, timeout: int = 1200) -> Optional[str]:
@@ -363,7 +341,6 @@ async def safe_attr(locator, attr: str, timeout: int = 1200) -> Optional[str]:
 
 
 async def handle_google_dialogs(page: Page) -> None:
-    # Consent/cookie dialogs vary by region. These are intentionally best-effort.
     labels = ["Accept all", "I agree", "Reject all", "Not now", "Skip", "Agree", "Accept"]
     for label in labels:
         try:
@@ -375,9 +352,16 @@ async def handle_google_dialogs(page: Page) -> None:
             pass
 
 
-async def get_list_name(page: Page, resolved_url: Optional[str] = None) -> Optional[str]:
-    selectors = ["h1", '[role="main"] h1', '[aria-level="1"]', 'meta[property="og:title"]']
-    for selector in selectors:
+async def get_page_metadata(page: Page, resolved_url: Optional[str] = None) -> Dict[str, Any]:
+    visible_text = ""
+    try:
+        visible_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+    except Exception:
+        pass
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", visible_text or "") if clean_text(x)]
+
+    list_name = None
+    for selector in ["h1", '[role="main"] h1', '[aria-level="1"]', 'meta[property="og:title"]']:
         try:
             if selector.startswith("meta"):
                 val = await page.locator(selector).first.get_attribute("content", timeout=1000)
@@ -387,130 +371,176 @@ async def get_list_name(page: Page, resolved_url: Optional[str] = None) -> Optio
             if text and text.lower() not in {"google maps", "maps"}:
                 text = re.sub(r"\s*-\s*Google Maps\s*$", "", text, flags=re.I).strip()
                 if text:
-                    return text
+                    list_name = text
+                    break
         except Exception:
             continue
-    try:
-        title = clean_text(await page.title())
-        if title:
-            title = re.sub(r"\s*-\s*Google Maps\s*$", "", title, flags=re.I).strip()
-            if title and title.lower() not in {"google maps", "maps"}:
-                return title
-    except Exception:
-        pass
-    if resolved_url:
-        # Shared list URLs don't usually have a useful slug, but use it as last resort.
-        path = urlparse(resolved_url).path.strip("/").split("/")
-        if path:
-            slug = unquote(path[-1]).replace("-", " ").replace("_", " ")
-            if len(slug) > 3 and not re.match(r"^[A-Za-z0-9_-]{15,}$", slug):
-                return clean_text(slug.title())
-    return None
+    if not list_name:
+        try:
+            title = clean_text(await page.title())
+            if title:
+                title = re.sub(r"\s*-\s*Google Maps\s*$", "", title, flags=re.I).strip()
+                if title and title.lower() not in {"google maps", "maps"}:
+                    list_name = title
+        except Exception:
+            pass
+
+    owner_name = None
+    if list_name and lines:
+        n_list = norm_text(list_name)
+        for i, line in enumerate(lines[:80]):
+            if norm_text(line) == n_list:
+                for nxt in lines[i + 1:i + 6]:
+                    if not nxt:
+                        continue
+                    if any(p.search(nxt) for p in COUNT_PATTERNS):
+                        continue
+                    if re.search(r"^(public|private|shared|edit|follow|directions|save)$", nxt, re.I):
+                        continue
+                    if len(nxt) <= 60:
+                        owner_name = nxt
+                        break
+                break
+    if not owner_name:
+        for pattern in [r"(?:By|Created by|List by)\s+([^\n\r]{2,60})", r"(?:만든 사람|작성자)\s*[:：]?\s*([^\n\r]{2,60})"]:
+            m = re.search(pattern, visible_text or "", re.I)
+            if m:
+                owner_name = clean_text(m.group(1))
+                break
+
+    expected_count = None
+    for pattern in COUNT_PATTERNS:
+        matches = [int(x) for x in pattern.findall(visible_text or "") if str(x).isdigit()]
+        matches = [x for x in matches if 1 <= x <= 500]
+        if matches:
+            # On list pages, the visible saved-list count is usually the smallest prominent count.
+            expected_count = min(matches)
+            break
+
+    return {
+        "listName": list_name,
+        "ownerName": owner_name,
+        "expectedCount": expected_count,
+        "visibleLinesPreview": lines[:35],
+    }
 
 
-async def collect_visible_dom_places(page: Page) -> List[Dict[str, Any]]:
-    # Extract in browser to avoid fragile Python locator loops. This grabs links and card text.
-    raw = await page.evaluate(
-        """
+async def collect_strict_list_candidates(page: Page) -> Dict[str, Any]:
+    return await page.evaluate(
+        r"""
         () => {
-          const out = [];
-          const push = (o) => { if (o && (o.href || o.text || o.aria)) out.push(o); };
-          document.querySelectorAll('a[href*="/maps/place/"], a[href*="maps?cid="], a[href*="google.com/maps"], a[href^="/maps/place/"]').forEach(a => {
-            push({href: a.href || a.getAttribute('href'), aria: a.getAttribute('aria-label'), text: a.innerText});
-          });
-          const cards = Array.from(document.querySelectorAll('div[role="article"], div.Nv2PK, div[jsaction*="mouseover:pane"], div[aria-label][role="button"], div[aria-label][tabindex]')).slice(0, 700);
-          for (const c of cards) {
-            const a = c.querySelector('a[href*="/maps/place/"], a[href*="maps?cid="], a[href^="/maps/place/"]');
-            push({href: a ? (a.href || a.getAttribute('href')) : '', aria: c.getAttribute('aria-label'), text: c.innerText});
+          const norm = (s) => (s || '').replace(/\u200e|\u202a|\ufeff/g, '').replace(/\s+/g, ' ').trim();
+          const isPlaceHref = (href) => !!href && (/\/maps\/place\//i.test(href) || /[?&]cid=\d+/i.test(href) || /[?&]ftid=0x[0-9a-f]+:0x[0-9a-f]+/i.test(href));
+          const titleFromHref = (href) => {
+            try {
+              const u = new URL(href, location.href);
+              const m = u.pathname.match(/\/maps\/place\/([^/@?]+)/i);
+              if (m) return decodeURIComponent(m[1].replace(/\+/g, ' '));
+              const q = u.searchParams.get('q') || u.searchParams.get('query');
+              if (q && !/^0x[0-9a-f]+:/i.test(q)) return decodeURIComponent(q.replace(/\+/g, ' '));
+            } catch(e) {}
+            return '';
+          };
+          const allContainers = Array.from(document.querySelectorAll('div[role="feed"], main, div[role="main"], section, div'));
+          const scored = [];
+          for (const el of allContainers) {
+            const anchors = Array.from(el.querySelectorAll('a[href]')).filter(a => isPlaceHref(a.href || a.getAttribute('href')));
+            if (!anchors.length) continue;
+            const rect = el.getBoundingClientRect();
+            const articleCount = el.querySelectorAll('div[role="article"], div[role="listitem"], div.Nv2PK').length;
+            const scrollBonus = el.scrollHeight > el.clientHeight + 80 ? 6 : 0;
+            const bodyPenalty = (el === document.body || el === document.documentElement) ? -100 : 0;
+            const widthPenalty = rect.width > window.innerWidth * 0.95 ? -8 : 0;
+            const score = anchors.length * 3 + articleCount * 2 + scrollBonus + widthPenalty + bodyPenalty;
+            scored.push({el, score, anchorCount: anchors.length, articleCount, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, role: el.getAttribute('role') || '', className: String(el.className || '').slice(0, 120), rect: {x: rect.x, y: rect.y, w: rect.width, h: rect.height}});
           }
-          return out;
+          scored.sort((a,b) => b.score - a.score);
+          let roots = scored.slice(0, 4).map(x => x.el);
+          if (!roots.length) roots = [document];
+
+          const rows = [];
+          const seen = new Set();
+          for (const root of roots) {
+            const anchors = Array.from(root.querySelectorAll('a[href]')).filter(a => isPlaceHref(a.href || a.getAttribute('href')));
+            for (const a of anchors) {
+              const href = a.href || a.getAttribute('href') || '';
+              if (!href || seen.has(href)) continue;
+              seen.add(href);
+              const card = a.closest('div[role="article"], div[role="listitem"], div.Nv2PK, div[jsaction*="mouseover:pane"], div[aria-label][role="button"]') || a.parentElement;
+              const text = norm(card ? card.innerText : a.innerText);
+              const aria = norm(a.getAttribute('aria-label') || (card ? card.getAttribute('aria-label') : '') || '');
+              const name = norm(titleFromHref(href) || aria || (text ? text.split('\n')[0] : ''));
+              const rect = (card || a).getBoundingClientRect();
+              rows.push({
+                href, aria, text, name,
+                source: 'strict_dom_place_anchor',
+                index: rows.length + 1,
+                rect: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)}
+              });
+            }
+          }
+          return {
+            url: location.href,
+            title: document.title,
+            rows,
+            containerCandidates: scored.slice(0, 8).map(({el, ...rest}) => rest),
+            visibleTextLength: document.body ? document.body.innerText.length : 0
+          };
         }
         """
     )
-    places: List[Dict[str, Any]] = []
-    for item in raw or []:
-        href = normalize_google_url(item.get("href") or "") if item.get("href") else None
-        aria = clean_text(item.get("aria"))
-        text = clean_text(item.get("text"))
-        name = aria or None
-        address = None
-        if text:
-            lines = [clean_text(x) for x in re.split(r"[\n\r]+", text) if clean_text(x)]
-            if not name and lines:
-                name = lines[0]
-            if len(lines) > 1:
-                address = next((x for x in lines[1:5] if not re.search(r"stars|reviews|minutes|closed|open", x, re.I)), None)
-        if href or name:
-            p = make_place(name=name, url=href, address=address, raw=" ".join([href or "", aria or "", text or ""]), source="dom")
-            if p:
-                places.append(p)
-    return places
 
 
-async def collect_state_texts(page: Page) -> List[Tuple[str, str]]:
-    texts: List[Tuple[str, str]] = []
-    try:
-        state = await page.evaluate(
-            """
-            () => {
-              const chunks = [];
-              const add = (name, value) => {
-                try { if (value !== undefined && value !== null) chunks.push([name, JSON.stringify(value)]); } catch (e) {}
-              };
-              add('APP_INITIALIZATION_STATE', window.APP_INITIALIZATION_STATE);
-              add('__APP_STATE__', window.__APP_STATE__);
-              add('WIZ_global_data', window.WIZ_global_data);
-              add('_F_cssRowKey', window._F_cssRowKey);
-              chunks.push(['location', location.href]);
-              chunks.push(['title', document.title]);
-              chunks.push(['anchors', Array.from(document.querySelectorAll('a[href]')).map(a => a.href).join('\n')]);
-              chunks.push(['visibleText', document.body ? document.body.innerText.slice(0, 300000) : '']);
-              chunks.push(['scripts', Array.from(document.scripts).slice(0, 80).map(s => s.textContent || '').join('\n').slice(0, 1500000)]);
-              return chunks;
-            }
-            """
-        )
-        for name, value in state or []:
-            if value:
-                texts.append((f"state:{name}", value))
-    except Exception as exc:
-        logger.info("state extraction failed: %s", exc)
-    return texts
-
-
-async def scroll_google_list(page: Page, rounds: int = 30, stop_after_no_change: int = 7) -> None:
-    previous_height = 0
-    still = 0
-    for _ in range(rounds):
+async def scroll_best_list_container(page: Page, rounds: int = 44, expected_count: Optional[int] = None) -> List[Dict[str, Any]]:
+    snapshots: List[Dict[str, Any]] = []
+    last_count = 0
+    stable = 0
+    for i in range(rounds):
         try:
-            metrics = await page.evaluate(
-                """
-                () => {
-                  const candidates = Array.from(document.querySelectorAll('div, main, section'))
-                    .filter(e => e.scrollHeight > e.clientHeight + 120)
-                    .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
-                  let total = 0;
-                  for (const el of candidates.slice(0, 8)) {
-                    total += el.scrollHeight;
-                    el.scrollTop = el.scrollHeight;
-                    el.dispatchEvent(new Event('scroll', {bubbles:true}));
-                  }
-                  window.scrollBy(0, Math.max(1200, document.body ? document.body.scrollHeight : 2000));
-                  return {height: document.body ? document.body.innerText.length : 0, scrollables: candidates.length, total};
-                }
-                """
-            )
-            h = int(metrics.get("height") or 0)
-            if h <= previous_height + 50:
-                still += 1
+            data = await collect_strict_list_candidates(page)
+            count = len(data.get("rows") or [])
+            snapshots.append({"round": i, "candidateRows": count, "containerCandidates": data.get("containerCandidates", [])[:3]})
+            if expected_count and count >= expected_count:
+                break
+            if count <= last_count:
+                stable += 1
             else:
-                still = 0
-                previous_height = h
-            if still >= stop_after_no_change:
+                stable = 0
+                last_count = count
+            if stable >= 9 and count > 0:
                 break
         except Exception:
             pass
-        await page.wait_for_timeout(850)
+        try:
+            await page.evaluate(
+                r"""
+                () => {
+                  const isPlaceHref = (href) => !!href && (/\/maps\/place\//i.test(href) || /[?&]cid=\d+/i.test(href) || /[?&]ftid=0x[0-9a-f]+:0x[0-9a-f]+/i.test(href));
+                  const candidates = Array.from(document.querySelectorAll('div[role="feed"], main, div[role="main"], section, div'))
+                    .map(el => {
+                      const anchors = Array.from(el.querySelectorAll('a[href]')).filter(a => isPlaceHref(a.href || a.getAttribute('href'))).length;
+                      const rect = el.getBoundingClientRect();
+                      const scrollBonus = el.scrollHeight > el.clientHeight + 80 ? 6 : 0;
+                      const bodyPenalty = (el === document.body || el === document.documentElement) ? -100 : 0;
+                      const widthPenalty = rect.width > window.innerWidth * 0.95 ? -8 : 0;
+                      return {el, score: anchors * 3 + scrollBonus + widthPenalty + bodyPenalty, anchors};
+                    })
+                    .filter(x => x.anchors > 0)
+                    .sort((a,b) => b.score - a.score);
+                  for (const c of candidates.slice(0, 4)) {
+                    c.el.scrollTop = c.el.scrollTop + Math.max(900, Math.floor(c.el.clientHeight * 0.85));
+                    c.el.dispatchEvent(new Event('scroll', {bubbles:true}));
+                    c.el.dispatchEvent(new WheelEvent('wheel', {deltaY: 1200, bubbles:true}));
+                  }
+                  window.scrollBy(0, 1000);
+                }
+                """
+            )
+            await page.keyboard.press("PageDown")
+        except Exception:
+            pass
+        await page.wait_for_timeout(900)
+    return snapshots
 
 
 async def enrich_place_details(context: BrowserContext, place: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -564,33 +594,7 @@ async def scrape_google_shared_list(req: ScrapeRequest) -> ScrapeResponse:
     source_url = str(req.listUrl)
     deadline = time.monotonic() + req.timeoutSeconds
     warnings: List[str] = []
-    debug_info: Dict[str, Any] = {"sources": {}, "responseUrls": []} if req.debug else {}
-
-    captured_texts: List[Tuple[str, str]] = []
-    captured_limit_chars = 7_000_000
-    captured_chars = 0
-
-    async def capture_response(response):
-        nonlocal captured_chars
-        try:
-            url = response.url
-            if "google" not in url and "gstatic" not in url:
-                return
-            if req.debug and len(debug_info.get("responseUrls", [])) < 100:
-                debug_info["responseUrls"].append(url[:300])
-            content_type = (response.headers.get("content-type") or "").lower()
-            if not any(x in content_type for x in ("text", "json", "javascript", "x-protobuf")):
-                return
-            if captured_chars >= captured_limit_chars:
-                return
-            text = await response.text()
-            if not text:
-                return
-            text = text[:1_200_000]
-            captured_texts.append((f"network:{url[:160]}", text))
-            captured_chars += len(text)
-        except Exception:
-            return
+    debug_info: Dict[str, Any] = {"version": APP_VERSION, "rounds": [], "acceptedPreview": [], "rejectedPreview": []} if req.debug else {}
 
     async with async_playwright() as p:
         proxy = None
@@ -624,46 +628,59 @@ async def scrape_google_shared_list(req: ScrapeRequest) -> ScrapeResponse:
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9,ko;q=0.8"},
         )
         page = await context.new_page()
-        page.on("response", lambda response: asyncio.create_task(capture_response(response)))
 
         try:
             try:
                 await page.goto(source_url, wait_until="domcontentloaded", timeout=55_000)
             except PlaywrightTimeoutError:
                 warnings.append("Google Maps took too long to load; using partial data collected so far.")
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(2600)
             await handle_google_dialogs(page)
             resolved_url = page.url
 
-            # First harvest: initial list payload and any visible rows.
-            state_texts = await collect_state_texts(page)
-            dom_places = await collect_visible_dom_places(page)
+            metadata = await get_page_metadata(page, resolved_url)
+            list_name = metadata.get("listName")
+            owner_name = metadata.get("ownerName")
+            expected_count = metadata.get("expectedCount")
+            if req.debug:
+                debug_info["metadata"] = metadata
 
-            # Scroll to trigger lazy list RPCs, then harvest again.
+            # Initial harvest, then strict scrolling of the saved-list panel.
+            first_data = await collect_strict_list_candidates(page)
+            if req.debug:
+                debug_info["initialContainerCandidates"] = first_data.get("containerCandidates", [])[:8]
+                debug_info["initialRawRows"] = (first_data.get("rows") or [])[:20]
+
             if time.monotonic() < deadline:
-                await scroll_google_list(page, rounds=38)
+                snapshots = await scroll_best_list_container(page, rounds=46, expected_count=expected_count)
+                if req.debug:
+                    debug_info["rounds"] = snapshots[:60]
                 await page.wait_for_timeout(1200)
-            state_texts += await collect_state_texts(page)
-            dom_places += await collect_visible_dom_places(page)
 
-            # Let network capture tasks finish.
-            await page.wait_for_timeout(1000)
+            final_data = await collect_strict_list_candidates(page)
+            raw_candidates = final_data.get("rows") or []
 
-            list_name = await get_list_name(page, resolved_url)
+            accepted: List[Dict[str, Any]] = []
+            rejected: List[Dict[str, Any]] = []
+            for c in raw_candidates:
+                c["debug"] = bool(req.debug)
+                place, reason = make_place_from_candidate(c, list_name, owner_name, strict=req.strictListOnly)
+                if place:
+                    accepted.append(place)
+                else:
+                    rejected.append({"reason": reason, "name": c.get("name"), "href": c.get("href"), "text": (c.get("text") or "")[:220]})
 
-            places: List[Dict[str, Any]] = []
-            places.extend(dom_places)
-            source_counts: Dict[str, int] = {"dom": len(dom_places)}
+            raw_count = len(raw_candidates)
+            places = dedupe_places(accepted, req.maxPlacesPerList)
 
-            for label, blob in state_texts + captured_texts:
-                extracted = extract_places_from_text_blob(blob, label)
-                source_counts[label.split(":", 1)[0]] = source_counts.get(label.split(":", 1)[0], 0) + len(extracted)
-                places.extend(extracted)
+            # If Google repeats place anchors across nested containers, final dedupe should land on the saved-list count.
+            if expected_count and len(places) > expected_count:
+                warnings.append(
+                    f"Extracted {len(places)} unique place-like links, but the visible saved-list count is {expected_count}. "
+                    "Returning the first saved-list rows only to avoid nearby/search/recommendation spillover."
+                )
+                places = places[:expected_count]
 
-            raw_count = len(places)
-            places = dedupe_places(places, req.maxPlacesPerList)
-
-            # Enrich only if requested. The app defaults false because detail pages are much slower.
             if req.scrapeDetails and places and time.monotonic() < deadline:
                 sem = asyncio.Semaphore(4)
 
@@ -677,22 +694,37 @@ async def scrape_google_shared_list(req: ScrapeRequest) -> ScrapeResponse:
 
             if not places:
                 warnings.append(
-                    "No places were extracted. The list may be private, Google may have served a consent/CAPTCHA page, or the Render IP may be blocked."
+                    "No saved-list place rows were extracted. The list may be private, Google may have served a consent/CAPTCHA page, or the Render IP may be blocked."
                 )
-            elif len(places) < 10:
+            elif expected_count and len(places) < expected_count:
                 warnings.append(
-                    "Only a small number of places were extracted. If the list has more, try making the list public, redeploying, or adding a proxy via PROXY_SERVER."
+                    f"Only {len(places)} of the visible {expected_count} saved-list places were extracted. This usually means the list panel did not finish lazy-loading."
                 )
+            elif expected_count and len(places) == expected_count:
+                warnings.append(f"Matched visible saved-list count: {expected_count} places.")
+
+            # Remove internal rawText field before normal app response unless debug enabled.
+            if not req.debug:
+                for p in places:
+                    p.pop("rawText", None)
 
             if req.debug:
-                debug_info["sources"] = source_counts
-                debug_info["capturedTextBlocks"] = len(captured_texts)
-                debug_info["resolvedUrl"] = resolved_url
-                debug_info["visibleDomCount"] = len(dom_places)
+                debug_info["finalContainerCandidates"] = final_data.get("containerCandidates", [])[:8]
+                debug_info["rawCandidateCount"] = raw_count
+                debug_info["acceptedBeforeDedupe"] = len(accepted)
+                debug_info["rejectedCount"] = len(rejected)
+                debug_info["acceptedPreview"] = [
+                    {"name": p.get("name"), "url": p.get("googleMapsUrl"), "source": p.get("source"), "listIndex": p.get("listIndex")}
+                    for p in places[:60]
+                ]
+                debug_info["rejectedPreview"] = rejected[:60]
+                debug_info["strictListOnly"] = req.strictListOnly
 
             return ScrapeResponse(
                 ok=bool(places),
                 listName=list_name,
+                ownerName=owner_name,
+                expectedCount=expected_count,
                 sourceUrl=source_url,
                 resolvedUrl=resolved_url,
                 count=len(places),
@@ -709,6 +741,8 @@ async def scrape_google_shared_list(req: ScrapeRequest) -> ScrapeResponse:
             return ScrapeResponse(
                 ok=False,
                 listName=None,
+                ownerName=None,
+                expectedCount=None,
                 sourceUrl=source_url,
                 resolvedUrl=None,
                 count=0,
@@ -726,7 +760,7 @@ async def scrape_google_shared_list(req: ScrapeRequest) -> ScrapeResponse:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    return {"ok": True, "status": "ok", "version": "2.0.0"}
+    return {"ok": True, "status": "ok", "version": APP_VERSION}
 
 
 @app.post("/scrape-google-list", response_model=ScrapeResponse)
@@ -745,6 +779,7 @@ async def app_import_get(
     maxPlacesPerList: int = Query(500, ge=1, le=500),
     scrapeDetails: bool = Query(False),
     debug: bool = Query(False),
+    strictListOnly: bool = Query(True),
 ) -> ScrapeResponse:
     try:
         req = ScrapeRequest(
@@ -752,7 +787,75 @@ async def app_import_get(
             maxPlacesPerList=maxPlacesPerList,
             scrapeDetails=scrapeDetails,
             debug=debug,
+            strictListOnly=strictListOnly,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return await scrape_google_shared_list(req)
+
+
+@app.post("/api/debug-google-list", response_model=ScrapeResponse)
+async def debug_endpoint(req: ScrapeRequest) -> ScrapeResponse:
+    req.debug = True
+    req.scrapeDetails = False
+    req.strictListOnly = True
+    return await scrape_google_shared_list(req)
+
+
+@app.get("/api/debug-google-list", response_model=ScrapeResponse)
+async def debug_get(
+    url: str = Query(..., description="Google Maps shared-list URL"),
+    maxPlacesPerList: int = Query(500, ge=1, le=500),
+) -> ScrapeResponse:
+    req = ScrapeRequest(listUrl=url, maxPlacesPerList=maxPlacesPerList, debug=True, scrapeDetails=False, strictListOnly=True)
+    return await scrape_google_shared_list(req)
+
+
+@app.get("/debug", response_class=HTMLResponse)
+async def debug_page() -> str:
+    return """
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Google Saved List Debug</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:18px;background:#fafafa;color:#111}textarea,input,button{font:inherit}textarea{width:100%;height:90px;border:1px solid #ccc;border-radius:12px;padding:12px;box-sizing:border-box}button{margin-top:10px;border:0;border-radius:12px;background:#111;color:#fff;padding:12px 16px;font-weight:700}.card{background:#fff;border:1px solid #e5e5e5;border-radius:16px;padding:14px;margin:14px 0;box-shadow:0 1px 4px rgba(0,0,0,.04)}.row{padding:9px 0;border-bottom:1px solid #eee}.small{font-size:13px;color:#666;word-break:break-all}pre{white-space:pre-wrap;word-break:break-word;background:#111;color:#eee;border-radius:12px;padding:12px;max-height:420px;overflow:auto}.bad{color:#b42318}.good{color:#067647}</style>
+</head>
+<body>
+<h2>Google Saved List Debug</h2>
+<p class="small">Saved list URL을 붙여넣고 실행하면, 실제로 어떤 항목을 장소로 받아들이고 어떤 항목을 버렸는지 보여줘요.</p>
+<textarea id="url" placeholder="https://maps.app.goo.gl/... 또는 Google Maps saved list URL"></textarea>
+<button onclick="run()">Run debug</button>
+<div id="out"></div>
+<script>
+async function run(){
+  const out = document.getElementById('out');
+  const url = document.getElementById('url').value.trim();
+  if(!url){ out.innerHTML='<p class="bad">URL을 넣어줘.</p>'; return; }
+  out.innerHTML='<div class="card">가져오는 중... Render free plan이면 1분 정도 걸릴 수 있어.</div>';
+  try{
+    const res = await fetch('/api/debug-google-list', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({listUrl:url, maxPlacesPerList:500, debug:true, scrapeDetails:false, strictListOnly:true})});
+    const data = await res.json();
+    const accepted = (data.debug && data.debug.acceptedPreview) || [];
+    const rejected = (data.debug && data.debug.rejectedPreview) || [];
+    out.innerHTML = `
+      <div class="card">
+        <div><b>List:</b> ${escapeHtml(data.listName||'')}</div>
+        <div><b>Owner:</b> ${escapeHtml(data.ownerName||'')}</div>
+        <div><b>Visible count:</b> ${data.expectedCount ?? ''}</div>
+        <div><b>Returned places:</b> <span class="good">${data.count}</span></div>
+        <div><b>Raw candidates:</b> ${data.rawItemCount}</div>
+        <div class="small">${(data.warnings||[]).map(escapeHtml).join('<br>')}</div>
+      </div>
+      <div class="card"><h3>Accepted places</h3>${accepted.map((p,i)=>`<div class="row"><b>${i+1}. ${escapeHtml(p.name||'')}</b><div class="small">${escapeHtml(p.url||'')}</div></div>`).join('') || '<div class="small">None</div>'}</div>
+      <div class="card"><h3>Rejected / ignored</h3>${rejected.map((p,i)=>`<div class="row"><b>${i+1}. ${escapeHtml(p.name||'')}</b><div class="small bad">${escapeHtml(p.reason||'')}</div><div class="small">${escapeHtml(p.href||'')}</div></div>`).join('') || '<div class="small">None</div>'}</div>
+      <div class="card"><h3>Full JSON</h3><pre>${escapeHtml(JSON.stringify(data,null,2))}</pre></div>`;
+  }catch(e){ out.innerHTML='<p class="bad">Failed: '+escapeHtml(String(e))+'</p>'; }
+}
+function escapeHtml(s){return String(s??'').replace(/[&<>'"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+</script>
+</body>
+</html>
+"""

@@ -1,17 +1,14 @@
 async function importGoogleSavedList(listUrl) {
-  const endpoint = 'https://gmap-shared-list-scraper.onrender.com/api/import-google-list';
-  const response = await fetch(endpoint, {
+  const res = await fetch('https://gmap-shared-list-scraper.onrender.com/api/import-google-list', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       listUrl,
       maxPlacesPerList: 500,
-      scrapeDetails: false
+      scrapeDetails: false,
+      strictListOnly: true
     })
   });
-  const data = await response.json();
-  if (!response.ok || !data.ok) {
-    throw new Error((data.warnings && data.warnings.join('\n')) || data.detail || 'Import failed');
-  }
-  return data;
+  if (!res.ok) throw new Error('Google saved-list import failed');
+  return await res.json();
 }
