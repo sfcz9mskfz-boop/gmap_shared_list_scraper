@@ -1,6 +1,6 @@
-# Google Maps Shared List Scraper - Strict v3
+# Google Maps Shared List Scraper - Strict v4
 
-This version fixes the previous over-extraction issue by using the visible saved-list panel as the source of truth.
+This version keeps the strict saved-list logic from v3, and adds a visual row click fallback for cases where Google shows the list shell/count but does not expose place anchors in the DOM.
 
 ## What changed in v3
 
@@ -10,6 +10,8 @@ This version fixes the previous over-extraction issue by using the visible saved
 - Reads list metadata separately: `listName`, `ownerName`, and visible count such as `43 places`.
 - If Google returns more unique place-like links than the visible saved-list count, v3 trims to the visible count to avoid nearby/search/recommendation spillover.
 - Adds `/debug`, a phone-friendly debug page showing accepted and rejected candidates.
+- Adds visual row click fallback: if no place links are visible, it clicks each visible saved-list row and reads the resulting place detail page.
+- Debug now shows `visualRounds` so you can see whether Google rendered rows at all.
 
 ## Endpoints
 
@@ -26,7 +28,8 @@ Body:
   "listUrl": "https://maps.app.goo.gl/...",
   "maxPlacesPerList": 500,
   "scrapeDetails": false,
-  "strictListOnly": true
+  "strictListOnly": true,
+  "clickFallback": true
 }
 ```
 
@@ -57,7 +60,7 @@ GET /health
 Expected:
 
 ```json
-{"ok": true, "status": "ok", "version": "3.0.0-strict-list"}
+{"ok": true, "status": "ok", "version": "4.0.0-strict-list-click-fallback"}
 ```
 
 ## Deploy on Render

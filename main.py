@@ -18,7 +18,7 @@ from playwright.async_api import BrowserContext, Page, TimeoutError as Playwrigh
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("gmaps-shared-list-strict")
 
-APP_VERSION = "3.0.0-strict-list"
+APP_VERSION = "4.0.0-strict-list-click-fallback"
 
 app = FastAPI(
     title="Google Maps Shared List Scraper - Strict Saved List Replica",
@@ -42,6 +42,7 @@ class ScrapeRequest(BaseModel):
     timeoutSeconds: int = Field(default=85, ge=20, le=220)
     debug: bool = False
     strictListOnly: bool = True
+    clickFallback: bool = True
 
 
 class ScrapeResponse(BaseModel):
@@ -543,6 +544,246 @@ async def scroll_best_list_container(page: Page, rounds: int = 44, expected_coun
     return snapshots
 
 
+async def collect_visual_row_candidates(page: Page, list_name: Optional[str], owner_name: Optional[str], expected_count: Optional[int] = None) -> Dict[str, Any]:
+    """Collect clickable/list-item DOM rows even when Google does not expose <a href="/maps/place/..."> anchors.
+
+    This is a fallback for Google saved-list pages where the list shell and count load, but each item is rendered
+    as JS-controlled clickable rows with no stable href in the DOM. Rows are marked with data-gmscrape-row-id so
+    Python can click them one by one and read the resulting place detail page.
+    """
+    data = await page.evaluate(
+        r"""
+        ({listName, ownerName, expectedCount}) => {
+          const norm = (s) => (s || '').replace(/\u200e|\u202a|\ufeff/g, '').replace(/\s+/g, ' ').trim();
+          const nkey = (s) => norm(s).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+          const listKey = nkey(listName || '');
+          const ownerKey = nkey(ownerName || '');
+          const junk = new Set(['directions','save','saved','share','nearby','sendtophone','website','call','copylink','route','open','close','more','menu','reviews','photos','googlemaps','maps','back','search','start','add','edit','remove','visited','wanttogo','viewall','done','cancel','learnmore','settings','sort','follow','following']);
+          const isVisible = (el) => {
+            const r = el.getBoundingClientRect();
+            const st = getComputedStyle(el);
+            return r.width > 40 && r.height > 18 && r.bottom > 0 && r.top < innerHeight && st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity || 1) > 0.05;
+          };
+          const getName = (text, aria) => {
+            const raw = norm(text || aria || '');
+            if (!raw) return '';
+            const pieces = raw.split(/\n| · |  {2,}/).map(norm).filter(Boolean);
+            for (const line of pieces.slice(0, 6)) {
+              const k = nkey(line);
+              if (!k || junk.has(k)) continue;
+              if (/^(\d+(\.\d+)?)\s*(stars?|reviews?|분|시간|km|mi)$/i.test(line)) continue;
+              if (/^(open|closed|영업|영업중|폐점|hours|rating|public|private)$/i.test(line)) continue;
+              if (/^\d{1,4}\s*(places?|장소|곳|件)$/i.test(line)) continue;
+              return line;
+            }
+            return pieces[0] || raw;
+          };
+          const all = Array.from(document.querySelectorAll('div[role="article"], div[role="listitem"], div[role="button"], div[jsaction], button, a, [aria-label]'));
+          const rows = [];
+          const seen = new Set();
+          let seq = 0;
+          for (const el of all) {
+            if (!isVisible(el)) continue;
+            const rect = el.getBoundingClientRect();
+            // Saved-list rows are usually in the main left/top panel, not tiny top buttons.
+            if (rect.height < 24 || rect.width < 120) continue;
+            const text = norm(el.innerText || '');
+            const aria = norm(el.getAttribute('aria-label') || '');
+            const raw = norm(text || aria);
+            if (!raw || raw.length < 2 || raw.length > 700) continue;
+            const name = getName(text, aria);
+            const key = nkey(name);
+            if (!key) continue;
+            if (junk.has(key)) continue;
+            if (listKey && key === listKey) continue;
+            if (ownerKey && key === ownerKey) continue;
+            if (listKey && ownerKey && key.includes(listKey) && key.includes(ownerKey)) continue;
+            if (/^\d{1,4}\s*(places?|장소|곳|件)$/i.test(name)) continue;
+            if (/^(public|private|shared|edit|follow|following|menu|search|directions|save|share)$/i.test(name)) continue;
+            // Skip parent containers that swallow many child rows.
+            const childArticles = el.querySelectorAll('div[role="article"], div[role="listitem"], div[role="button"]').length;
+            if (childArticles > 3) continue;
+            const dedupe = key + ':' + Math.round(rect.top/8) + ':' + Math.round(rect.left/8);
+            if (seen.has(dedupe)) continue;
+            seen.add(dedupe);
+            seq += 1;
+            const id = 'gmscrape_' + Date.now() + '_' + seq;
+            el.setAttribute('data-gmscrape-row-id', id);
+            rows.push({
+              scrapeId: id,
+              name,
+              aria,
+              text: raw.slice(0, 650),
+              tag: el.tagName,
+              role: el.getAttribute('role') || '',
+              href: el.href || el.getAttribute('href') || '',
+              index: seq,
+              rect: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)}
+            });
+          }
+          rows.sort((a,b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));
+          return {rows: rows.slice(0, 80), visibleTextLength: document.body ? document.body.innerText.length : 0, url: location.href, title: document.title};
+        }
+        """,
+        {"listName": list_name or "", "ownerName": owner_name or "", "expectedCount": expected_count},
+    )
+    return data
+
+
+async def scroll_generic_list_panel(page: Page) -> None:
+    try:
+        await page.evaluate(
+            r"""
+            () => {
+              const candidates = Array.from(document.querySelectorAll('div[role="feed"], main, div[role="main"], section, div'))
+                .map(el => {
+                  const r = el.getBoundingClientRect();
+                  const scrollable = el.scrollHeight > el.clientHeight + 80;
+                  const textLen = (el.innerText || '').length;
+                  const visible = r.width > 180 && r.height > 120 && r.bottom > 0 && r.top < innerHeight;
+                  const bodyPenalty = (el === document.body || el === document.documentElement) ? -1000 : 0;
+                  const score = (scrollable ? 200 : 0) + Math.min(textLen, 5000) / 50 + Math.max(0, 800 - r.x) / 20 + bodyPenalty;
+                  return {el, score, visible, scrollable};
+                })
+                .filter(x => x.visible)
+                .sort((a,b) => b.score - a.score);
+              for (const c of candidates.slice(0, 5)) {
+                const delta = Math.max(700, Math.floor((c.el.clientHeight || 800) * 0.82));
+                c.el.scrollTop = c.el.scrollTop + delta;
+                c.el.dispatchEvent(new Event('scroll', {bubbles:true}));
+                c.el.dispatchEvent(new WheelEvent('wheel', {deltaY: delta, bubbles:true}));
+              }
+              window.scrollBy(0, 850);
+            }
+            """
+        )
+        await page.keyboard.press("PageDown")
+    except Exception:
+        pass
+
+
+async def scrape_current_place_after_click(page: Page, seed: Dict[str, Any], list_name: Optional[str], owner_name: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    await page.wait_for_timeout(1600)
+    url = page.url
+    h1 = await safe_text(page.locator('h1'), timeout=1800)
+    seed_name = clean_text(seed.get('name'))
+    name = h1 or seed_name
+    address = await safe_attr(page.locator('button[data-item-id="address"], button[aria-label^="Address:" i]'), 'aria-label', timeout=900)
+    if address:
+        address = clean_text(re.sub(r"^Address:\s*", "", address, flags=re.I))
+    rating = None
+    rating_text = await safe_text(page.locator('div.F7nice span[aria-hidden="true"]'), timeout=700)
+    if rating_text:
+        m = re.search(r"\d+(?:\.\d+)?", rating_text)
+        if m:
+            try:
+                rating = float(m.group(0))
+            except Exception:
+                pass
+    lat, lng = extract_lat_lng_from_text(url)
+    ids = extract_ids(url)
+    candidate = {
+        "name": name,
+        "href": url,
+        "url": url,
+        "address": address,
+        "rawText": seed.get("text") or "",
+        "source": "visual_click_fallback",
+        "index": seed.get("index"),
+    }
+    place, reason = make_place_from_candidate(candidate, list_name, owner_name, strict=False)
+    if not place:
+        return None, reason
+    # Require some evidence that the click opened a place, not a list/UI control.
+    evidence = has_place_url(url) or ids.get('cid') or ids.get('featureId') or (lat is not None and lng is not None) or bool(address)
+    if not evidence:
+        return None, "clicked row did not open a recognizable place detail"
+    if rating is not None:
+        place["rating"] = rating
+    if address:
+        place["address"] = address
+    return place, None
+
+
+async def collect_places_by_click_fallback(page: Page, list_name: Optional[str], owner_name: Optional[str], expected_count: Optional[int], max_places: int, deadline: float, debug_info: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    places: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    seen_keys = set()
+    list_url = page.url
+    max_target = min(max_places, expected_count or max_places)
+
+    for round_i in range(0, 70):
+        if time.monotonic() >= deadline or len(places) >= max_target:
+            break
+        data = await collect_visual_row_candidates(page, list_name, owner_name, expected_count)
+        rows = data.get('rows') or []
+        if debug_info is not None:
+            debug_info.setdefault('visualRounds', []).append({
+                'round': round_i,
+                'visualRows': len(rows),
+                'preview': [{k: r.get(k) for k in ('name','tag','role','href','rect')} for r in rows[:12]],
+            })
+        clicked_any = False
+        for row in rows[:30]:
+            if time.monotonic() >= deadline or len(places) >= max_target:
+                break
+            nkey = norm_text(row.get('name'))
+            if not nkey or nkey in seen_keys:
+                continue
+            # Avoid obvious non-place UI rows.
+            temp = {"name": row.get('name'), "url": row.get('href'), "rawText": row.get('text')}
+            rr = reject_reason(temp, list_name, owner_name, strict=False)
+            if rr and rr not in {"not a Google Maps place/cid/ftid URL"}:
+                rejected.append({"reason": rr, "name": row.get('name'), "text": (row.get('text') or '')[:200]})
+                seen_keys.add(nkey)
+                continue
+            try:
+                loc = page.locator(f'[data-gmscrape-row-id="{row.get("scrapeId")}"]').first
+                await loc.scroll_into_view_if_needed(timeout=2500)
+                await page.wait_for_timeout(300)
+                before_url = page.url
+                await loc.click(timeout=3500, force=True)
+                clicked_any = True
+                place, reason = await scrape_current_place_after_click(page, row, list_name, owner_name)
+                if place:
+                    places.append(place)
+                    seen_keys.add(norm_text(place.get('name')) or nkey)
+                    if place.get('cid'):
+                        seen_keys.add('cid:' + str(place['cid']))
+                    if place.get('featureId'):
+                        seen_keys.add('ftid:' + str(place['featureId']))
+                else:
+                    rejected.append({"reason": reason, "name": row.get('name'), "text": (row.get('text') or '')[:200], "urlAfterClick": page.url})
+                    seen_keys.add(nkey)
+                # Return to list. Google Maps is an SPA; go_back normally returns from detail to list.
+                try:
+                    if page.url != before_url:
+                        await page.go_back(wait_until='domcontentloaded', timeout=9000)
+                    else:
+                        # Sometimes the side pane changes without URL. Try Escape/back button.
+                        await page.keyboard.press('Escape')
+                except Exception:
+                    try:
+                        await page.goto(list_url, wait_until='domcontentloaded', timeout=20000)
+                    except Exception:
+                        pass
+                await page.wait_for_timeout(1200)
+                await handle_google_dialogs(page)
+            except Exception as exc:
+                rejected.append({"reason": f"click fallback failed: {type(exc).__name__}", "name": row.get('name'), "text": (row.get('text') or '')[:200]})
+                seen_keys.add(nkey)
+                try:
+                    await page.goto(list_url, wait_until='domcontentloaded', timeout=18000)
+                    await page.wait_for_timeout(800)
+                except Exception:
+                    pass
+        await scroll_generic_list_panel(page)
+        await page.wait_for_timeout(900)
+        if not clicked_any and round_i >= 3:
+            break
+    return dedupe_places(places, max_target), rejected
+
+
 async def enrich_place_details(context: BrowserContext, place: Dict[str, Any], index: int) -> Dict[str, Any]:
     url = place.get("googleMapsUrl") or place.get("url")
     if not url:
@@ -673,6 +914,16 @@ async def scrape_google_shared_list(req: ScrapeRequest) -> ScrapeResponse:
             raw_count = len(raw_candidates)
             places = dedupe_places(accepted, req.maxPlacesPerList)
 
+            if req.clickFallback and not places and time.monotonic() < deadline:
+                warnings.append("No place anchors were visible, so v4 is trying visual row click fallback.")
+                click_places, click_rejected = await collect_places_by_click_fallback(
+                    page, list_name, owner_name, expected_count, req.maxPlacesPerList, deadline, debug_info if req.debug else None
+                )
+                places = dedupe_places(click_places, req.maxPlacesPerList)
+                if req.debug:
+                    debug_info["clickFallbackRejectedPreview"] = click_rejected[:60]
+                    debug_info["clickFallbackCount"] = len(places)
+
             # If Google repeats place anchors across nested containers, final dedupe should land on the saved-list count.
             if expected_count and len(places) > expected_count:
                 warnings.append(
@@ -719,6 +970,7 @@ async def scrape_google_shared_list(req: ScrapeRequest) -> ScrapeResponse:
                 ]
                 debug_info["rejectedPreview"] = rejected[:60]
                 debug_info["strictListOnly"] = req.strictListOnly
+                debug_info["clickFallback"] = req.clickFallback
 
             return ScrapeResponse(
                 ok=bool(places),
